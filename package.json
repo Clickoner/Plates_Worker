@@ -2,7 +2,11 @@
   "name": "plates-worker",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "worker": "node worker.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
   }
 }

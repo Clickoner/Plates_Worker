@@ -1,0 +1,5 @@
+console.log("SUPABASE_URL:", process.env.SUPABASE_URL);
+console.log("SERVICE KEY present:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const test = await supabase.from("plate_jobs").select("id").limit(1);
+console.log("Supabase test query:", test.error ? test.error.message : "OK");

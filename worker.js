@@ -1,306 +1,270 @@
-import { createClient } from "@supabase/supabase-js";
-import { spawn } from "node:child_process";
-import fs from "node:fs/promises";
-import path from "node:path";
-import os from "node:os";
-import crypto from "node:crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import sharp from "sharp";
+import { createClient } from "@supabase/supabase-js";
+
+const execFileAsync = promisify(execFile);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const BUCKET = "separations"; // per your note
-
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("Missing env vars: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY");
+  console.error("Missing env vars. Need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BUCKET = "separations";
+const POLL_MS = 1500;
 
-function runCmd(cmd, args, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { ...opts, stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (d) => (out += d.toString()));
-    child.stderr.on("data", (d) => (err += d.toString()));
-    child.on("close", (code) => {
-      if (code === 0) resolve({ out, err });
-      else reject(new Error(`${cmd} exited ${code}\n${err || out}`));
-    });
-  });
+// ---- helpers
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-async function assertGhostscript() {
-  const { out } = await runCmd("gs", ["--version"]);
-  console.log("✅ Ghostscript found. Version:", out.trim());
-}
-
-function safeName(s) {
-  return String(s)
-    .replace(/[^\w.-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
+function safeBasename(name) {
+  return (name || "spot")
+    .replace(/[^\w\-\. ]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
     .slice(0, 80);
 }
 
-function plateKeyFromLabel(label) {
-  const p = label.toLowerCase();
-  if (p === "c" || p.includes("cyan")) return "C";
-  if (p === "m" || p.includes("magenta")) return "M";
-  if (p === "y" || p.includes("yellow")) return "Y";
-  if (p === "k" || p.includes("black")) return "K";
-  return "SPOT";
-}
+async function uploadAndGetPublicUrl(storagePath, fileBuffer, contentType = "image/png") {
+  // Upsert so re-runs overwrite
+  const { error: upErr } = await supabase.storage.from(BUCKET).upload(storagePath, fileBuffer, {
+    upsert: true,
+    contentType,
+    cacheControl: "3600",
+  });
+  if (upErr) throw new Error(`Upload failed (${storagePath}): ${upErr.message}`);
 
-function spotColorFromName(name) {
-  // deterministic “nice” color from plate name
-  const h = crypto.createHash("md5").update(name).digest();
-  const r = 120 + (h[0] % 120);
-  const g = 120 + (h[1] % 120);
-  const b = 120 + (h[2] % 120);
-  return { r, g, b };
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(storagePath);
+  if (!data?.publicUrl) throw new Error(`No public URL returned for ${storagePath}`);
+  return data.publicUrl;
 }
 
 /**
- * Convert grayscale plate into a tinted RGB preview:
- * - C: R=gray, G=255, B=255
- * - M: R=255, G=gray, B=255
- * - Y: R=255, G=255, B=gray
- * - K: R=gray, G=gray, B=gray
- * - Spot: tint using deterministic RGB based on name
+ * Convert a grayscale separation TIFF into a colored RGBA PNG where:
+ * - RGB is fixed to the plate color
+ * - Alpha is ink coverage (derived from grayscale)
+ *
+ * Assumption: TIFF grayscale is "paper=white(255), ink=black(0)" -> alpha = 255 - gray
  */
-async function colorizeGrayscale(grayPngBuffer, key, labelForSpot) {
-  const { data, info } = await sharp(grayPngBuffer)
+async function makePlatePngFromTiff(tiffPath, rgb /* [r,g,b] */) {
+  const { data, info } = await sharp(tiffPath)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
+  // raw is RGBA even for grayscale conversions; we use R as gray
   const out = Buffer.alloc(info.width * info.height * 4);
 
-  let spotRGB = null;
-  if (key === "SPOT") spotRGB = spotColorFromName(labelForSpot);
-
   for (let i = 0; i < info.width * info.height; i++) {
-    const gray = data[i * 4]; // grayscale in R channel
-    let r, g, b;
+    const gray = data[i * 4]; // 0..255
+    const alpha = 255 - gray; // ink amount
 
-    if (key === "C") {
-      r = gray; g = 255; b = 255;
-    } else if (key === "M") {
-      r = 255; g = gray; b = 255;
-    } else if (key === "Y") {
-      r = 255; g = 255; b = gray;
-    } else if (key === "K") {
-      r = gray; g = gray; b = gray;
-    } else {
-      // Spot: stronger color where ink is heavier (lower gray)
-      const strength = 1 - gray / 255;
-      r = Math.round(255 - (255 - spotRGB.r) * strength);
-      g = Math.round(255 - (255 - spotRGB.g) * strength);
-      b = Math.round(255 - (255 - spotRGB.b) * strength);
-    }
-
-    out[i * 4 + 0] = r;
-    out[i * 4 + 1] = g;
-    out[i * 4 + 2] = b;
-    out[i * 4 + 3] = 255;
+    out[i * 4 + 0] = rgb[0];
+    out[i * 4 + 1] = rgb[1];
+    out[i * 4 + 2] = rgb[2];
+    out[i * 4 + 3] = alpha;
   }
 
-  return sharp(out, { raw: { width: info.width, height: info.height, channels: 4 } })
+  return sharp(out, {
+    raw: { width: info.width, height: info.height, channels: 4 },
+  })
     .png()
     .toBuffer();
 }
 
-async function uploadBuffer(storagePath, buffer, contentType = "image/png") {
-  const { error } = await supabase.storage.from(BUCKET).upload(storagePath, buffer, {
-    contentType,
-    upsert: true,
-  });
-  if (error) throw new Error(`Upload failed (${storagePath}): ${error.message}`);
-
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(storagePath);
-  return data.publicUrl;
-}
-
-async function downloadToFile(storagePath, localPath) {
-  const { data, error } = await supabase.storage.from(BUCKET).download(storagePath);
-  if (error) throw new Error(`Download failed (${storagePath}): ${error.message}`);
-
-  const ab = await data.arrayBuffer();
-  await fs.writeFile(localPath, Buffer.from(ab));
-}
-
 /**
- * Extract a SINGLE page to a temp PDF so tiffsep runs per-page.
- * pageIndex is 0-based in your payload.
- * Ghostscript uses 1-based page numbers for -dFirstPage/-dLastPage.
+ * Build a composite preview PNG by multiplying plate layers onto white.
+ * This is a simple visual composite; your viewer may also do blending client-side.
  */
-async function extractSinglePagePdf(inputPdf, pageIndex, outPdf) {
-  const pageNum = Number(pageIndex) + 1;
-  await runCmd("gs", [
-    "-q",
-    "-dNOPAUSE",
+async function makeCompositePng(platePngs /* array of {buffer} */) {
+  if (!platePngs.length) return null;
+
+  // Use first plate to get dimensions
+  const meta = await sharp(platePngs[0].buffer).metadata();
+  const width = meta.width || 1;
+  const height = meta.height || 1;
+
+  // Start with white background
+  let base = sharp({
+    create: { width, height, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
+  });
+
+  // Multiply each plate on top
+  // (sharp composite "multiply" uses RGB; alpha is respected)
+  const composites = platePngs.map((p) => ({
+    input: p.buffer,
+    blend: "multiply",
+  }));
+
+  return base.composite(composites).png().toBuffer();
+}
+
+function classifySeparationFile(fileName) {
+  const lower = fileName.toLowerCase();
+
+  // Ghostscript tiffsep often outputs names containing "cyan", "magenta", etc.
+  if (lower.includes("cyan")) return { kind: "cmyk", key: "c" };
+  if (lower.includes("magenta")) return { kind: "cmyk", key: "m" };
+  if (lower.includes("yellow")) return { kind: "cmyk", key: "y" };
+  if (lower.includes("black")) return { kind: "cmyk", key: "k" };
+
+  // Otherwise treat as spot (Pantone/varnish/white/dieline etc)
+  return { kind: "spot", key: null };
+}
+
+async function downloadPdfToTemp(pdfStoragePath) {
+  const { data, error } = await supabase.storage.from(BUCKET).download(pdfStoragePath);
+  if (error) throw new Error(`PDF download failed (${pdfStoragePath}): ${error.message}`);
+  const arrayBuf = await data.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+async function runGhostscriptTiffSep({ pdfPath, outDir, pageIndex, dpi }) {
+  // gs uses 1-based page numbers
+  const pageNum = (pageIndex ?? 0) + 1;
+
+  // Output pattern; gs will create multiple files for each separation
+  const outPattern = path.join(outDir, "sep-%04d.tif");
+
+  const args = [
+    "-dSAFER",
     "-dBATCH",
+    "-dNOPAUSE",
+    `-r${dpi || 150}`,
+    "-sDEVICE=tiffsep",
     `-dFirstPage=${pageNum}`,
     `-dLastPage=${pageNum}`,
-    "-sDEVICE=pdfwrite",
-    "-o",
-    outPdf,
-    inputPdf,
-  ]);
+    `-sOutputFile=${outPattern}`,
+    pdfPath,
+  ];
+
+  await execFileAsync("gs", args, { timeout: 10 * 60 * 1000 }); // 10 min
 }
 
-/**
- * Run Ghostscript tiffsep against the single-page PDF.
- * Returns list of TIFFs produced.
- */
-async function gsExtractTiffSeps(singlePagePdf, outDir, dpi) {
-  const outPattern = path.join(outDir, "sep_%03d.tif");
-
-  await runCmd("gs", [
-    "-q",
-    "-dNOPAUSE",
-    "-dBATCH",
-    "-sDEVICE=tiffsep",
-    `-r${dpi}`,
-    "-o",
-    outPattern,
-    singlePagePdf,
-  ]);
-
-  const files = (await fs.readdir(outDir))
-    .filter((f) => f.toLowerCase().endsWith(".tif") || f.toLowerCase().endsWith(".tiff"))
-    .map((f) => path.join(outDir, f));
-
-  if (!files.length) throw new Error("Ghostscript produced no TIFF separation files.");
-  return files;
-}
-
-async function tiffToGrayPng(tiffPath) {
-  return sharp(tiffPath).grayscale().png().toBuffer();
-}
-
-/**
- * We try to infer plate names from filename.
- * If Ghostscript produces generic names (sep_001.tif),
- * we still handle it, but you’ll get "sep_001" etc as spot names.
- * If you want “real” spot names (Pantone/Varnish/etc),
- * we’ll need a later enhancement to parse plate names from the PDF.
- */
-function guessPlateLabelFromFilename(filePath) {
-  const base = path.basename(filePath).toLowerCase();
-
-  if (base.includes("cyan")) return "Cyan";
-  if (base.includes("magenta")) return "Magenta";
-  if (base.includes("yellow")) return "Yellow";
-  if (base.includes("black")) return "Black";
-
-  return safeName(path.basename(filePath, path.extname(filePath)));
-}
-
-async function setProofPageStatus(proofPageId, status, errorMsg = null) {
-  const updateObj = {
-    separations_status: status,
-    separations_error: errorMsg,
-  };
-  await supabase.from("proof_pages").update(updateObj).eq("id", proofPageId);
-}
-
-async function processJob(job) {
+async function processOneJob(job) {
   const payload = job.payload || {};
-
+  const pdfStoragePath = payload.pdf_storage_path; // IMPORTANT: matches your actual payload
   const proofPageId = payload.proof_page_id;
-  const pdfStoragePath = payload.pdf_storage_path;
   const pageIndex = payload.page_index ?? 0;
   const dpi = payload.dpi ?? 150;
 
-  if (!proofPageId || !pdfStoragePath) {
-    throw new Error("Job payload missing proof_page_id and/or pdf_storage_path");
+  if (!pdfStoragePath || !proofPageId) {
+    throw new Error("Job payload missing pdf_storage_path or proof_page_id");
   }
 
-  await setProofPageStatus(proofPageId, "processing", null);
+  // Set proof_pages status early so UI can show progress
+  await supabase
+    .from("proof_pages")
+    .update({ separations_status: "processing", separations_error: null })
+    .eq("id", proofPageId);
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "plates-"));
-  const localPdf = path.join(tmpDir, "input.pdf");
-  const singlePagePdf = path.join(tmpDir, "page.pdf");
-  const outDir = path.join(tmpDir, "out");
-  await fs.mkdir(outDir, { recursive: true });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plates-"));
+  const pdfPath = path.join(tmpRoot, "input.pdf");
+  const sepDir = path.join(tmpRoot, "out");
+  fs.mkdirSync(sepDir, { recursive: true });
 
-  console.log("⬇️ Downloading PDF:", pdfStoragePath);
-  await downloadToFile(pdfStoragePath, localPdf);
+  try {
+    // 1) Download PDF
+    const pdfBuf = await downloadPdfToTemp(pdfStoragePath);
+    fs.writeFileSync(pdfPath, pdfBuf);
 
-  console.log(`📄 Extracting page ${pageIndex} to single-page PDF...`);
-  await extractSinglePagePdf(localPdf, pageIndex, singlePagePdf);
+    // 2) Run Ghostscript separation
+    await runGhostscriptTiffSep({ pdfPath, outDir: sepDir, pageIndex, dpi });
 
-  console.log(`🧪 Running Ghostscript separations @${dpi}dpi...`);
-  const tiffFiles = await gsExtractTiffSeps(singlePagePdf, outDir, dpi);
+    // 3) Collect TIFF outputs
+    const files = fs.readdirSync(sepDir).filter((f) => f.toLowerCase().endsWith(".tif"));
+    if (!files.length) throw new Error("Ghostscript produced no separation TIFFs");
 
-  // Upload outputs to: separations/<proof_page_id>/...
-  const plateFolder = `separations/${proofPageId}`;
+    // 4) Convert to colored PNG plates + upload
+    const plateColor = {
+      c: [0, 255, 255],
+      m: [255, 0, 255],
+      y: [255, 255, 0],
+      k: [0, 0, 0],
+    };
 
-  const results = {
-    proof_page_id: proofPageId,
-    page_index: pageIndex,
-    dpi,
-    bucket: BUCKET,
-    plates: {},
-    spots: [],
-  };
+    let c_url = null,
+      m_url = null,
+      y_url = null,
+      k_url = null;
 
-  let cUrl = null, mUrl = null, yUrl = null, kUrl = null;
-  const spotPlatesArr = [];
+    const spot_plates = [];
+    const compositeLayers = [];
 
-  for (const tiff of tiffFiles) {
-    const plateLabel = guessPlateLabelFromFilename(tiff);
-    const key = plateKeyFromLabel(plateLabel);
+    for (const f of files) {
+      const full = path.join(sepDir, f);
+      const cls = classifySeparationFile(f);
 
-    const grayPng = await tiffToGrayPng(tiff);
-    const tinted = await colorizeGrayscale(grayPng, key, plateLabel);
+      if (cls.kind === "cmyk") {
+        const key = cls.key;
+        const pngBuf = await makePlatePngFromTiff(full, plateColor[key]);
 
-    const grayPath = `${plateFolder}/${safeName(plateLabel)}_gray.png`;
-    const tintPath = `${plateFolder}/${safeName(plateLabel)}.png`;
+        const storagePath = `separations/${proofPageId}/page-${pageIndex}/${key}.png`;
+        const url = await uploadAndGetPublicUrl(storagePath, pngBuf, "image/png");
 
-    const grayUrl = await uploadBuffer(grayPath, grayPng, "image/png");
-    const tintUrl = await uploadBuffer(tintPath, tinted, "image/png");
+        if (key === "c") c_url = url;
+        if (key === "m") m_url = url;
+        if (key === "y") y_url = url;
+        if (key === "k") k_url = url;
 
-    results.plates[plateLabel] = { gray: grayUrl, tinted: tintUrl };
+        compositeLayers.push({ buffer: pngBuf });
+      } else {
+        const spotNameGuess = safeBasename(
+          path
+            .basename(f, path.extname(f))
+            .replace(/^sep-\d+/i, "")
+            .replace(/[._-]+/g, " ")
+        );
 
-    if (key === "C") cUrl = tintUrl;
-    else if (key === "M") mUrl = tintUrl;
-    else if (key === "Y") yUrl = tintUrl;
-    else if (key === "K") kUrl = tintUrl;
-    else {
-      results.spots.push({ name: plateLabel, url: tintUrl, gray_url: grayUrl });
-      spotPlatesArr.push({ name: plateLabel, url: tintUrl });
+        // spots get a neutral “ink” look; viewer can color it if you want later
+        const spotPng = await makePlatePngFromTiff(full, [0, 0, 0]);
+        const storagePath = `separations/${proofPageId}/page-${pageIndex}/spot-${spotNameGuess}.png`;
+        const url = await uploadAndGetPublicUrl(storagePath, spotPng, "image/png");
+
+        spot_plates.push({ name: spotNameGuess || "Spot", url });
+        compositeLayers.push({ buffer: spotPng });
+      }
     }
+
+    // 5) Composite (optional but your schema supports it)
+    const compositeBuf = await makeCompositePng(compositeLayers);
+    let composite_url = null;
+    if (compositeBuf) {
+      const storagePath = `separations/${proofPageId}/page-${pageIndex}/composite.png`;
+      composite_url = await uploadAndGetPublicUrl(storagePath, compositeBuf, "image/png");
+    }
+
+    // 6) Update proof_pages with URLs + spot plates
+    const update = {
+      c_url,
+      m_url,
+      y_url,
+      k_url,
+      composite_url,
+      spot_plates,
+      separations_status: "done",
+      separations_error: null,
+    };
+
+    const { error: updErr } = await supabase.from("proof_pages").update(update).eq("id", proofPageId);
+    if (updErr) throw new Error(`Failed updating proof_pages: ${updErr.message}`);
+
+    return { ok: true, proof_page_id: proofPageId, page_index: pageIndex, ...update };
+  } finally {
+    // Cleanup temp
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {}
   }
-
-  // Update proof_pages with URLs + spot_plates inline JSONB
-  const updateObj = {
-    c_url: cUrl,
-    m_url: mUrl,
-    y_url: yUrl,
-    k_url: kUrl,
-    spot_plates: spotPlatesArr,
-    separations_status: "done",
-    separations_error: null,
-  };
-
-  // Only set keys that exist (avoid overwriting with null if a plate isn't produced)
-  Object.keys(updateObj).forEach((k) => {
-    if (updateObj[k] === null) delete updateObj[k];
-  });
-
-  const { error: ppErr } = await supabase.from("proof_pages").update(updateObj).eq("id", proofPageId);
-  if (ppErr) throw new Error(`Updating proof_pages failed: ${ppErr.message}`);
-
-  // Cleanup
-  try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch {}
-
-  return results;
 }
 
 async function tryClaimOneJob() {
@@ -316,7 +280,7 @@ async function tryClaimOneJob() {
     console.error("Error finding job:", findErr.message);
     return;
   }
-  if (!jobs || jobs.length === 0) return;
+  if (!jobs?.length) return;
 
   const job = jobs[0];
 
@@ -335,49 +299,51 @@ async function tryClaimOneJob() {
   }
   if (!locked) return;
 
-  console.log("✅ Picked up job:", job.id);
+  console.log("✅ Picked up separation job:", job.id);
 
   try {
-    const result = await processJob(job);
+    const result = await processOneJob(job);
 
     const { error: doneErr } = await supabase
       .from("plate_jobs")
-      .update({ status: "done", result, error: null })
+      .update({ status: "done", result })
       .eq("id", job.id);
 
-    if (doneErr) throw new Error(doneErr.message);
+    if (doneErr) throw new Error(`Error marking job done: ${doneErr.message}`);
 
-    console.log("🎉 Job done:", job.id);
+    console.log("🎉 Separation job done:", job.id);
   } catch (e) {
     const msg = e?.message || String(e);
-    console.error("❌ Job failed:", job.id, msg);
+    console.error("❌ Separation job failed:", job.id, msg);
 
-    // best-effort: set proof_pages error if we can read proof_page_id
+    // Best effort: write failure to both tables
+    await supabase.from("plate_jobs").update({ status: "failed", error: msg }).eq("id", job.id);
+
+    // If payload had proof_page_id, mark proof_pages error too
     const proofPageId = job?.payload?.proof_page_id;
     if (proofPageId) {
-      try {
-        await setProofPageStatus(proofPageId, "failed", msg);
-      } catch {}
+      await supabase
+        .from("proof_pages")
+        .update({ separations_status: "failed", separations_error: msg })
+        .eq("id", proofPageId);
     }
-
-    await supabase
-      .from("plate_jobs")
-      .update({ status: "failed", error: msg })
-      .eq("id", job.id);
   }
 }
 
-async function loop() {
-  await assertGhostscript();
+async function main() {
   console.log("Plates worker started ✅");
+  // Optional: show gs version in logs
+  try {
+    const { stdout } = await execFileAsync("gs", ["--version"]);
+    console.log("✅ Ghostscript found. Version:", String(stdout).trim());
+  } catch {
+    console.log("⚠️ Ghostscript not found on PATH (gs). Separations will fail.");
+  }
 
   while (true) {
     await tryClaimOneJob();
-    await sleep(2000);
+    await sleep(POLL_MS);
   }
 }
 
-loop().catch((e) => {
-  console.error("Fatal worker error:", e?.message || e);
-  process.exit(1);
-});
+main();

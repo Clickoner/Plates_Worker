@@ -251,7 +251,7 @@ async function processOneJob(job) {
       k_url,
       composite_url,
       spot_plates,
-      separations_status: "done",
+      separations_status: "ready",
       separations_error: null,
     };
 

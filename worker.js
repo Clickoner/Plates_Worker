@@ -54,8 +54,12 @@ async function uploadAndGetPublicUrl(storagePath, fileBuffer, contentType = "ima
  * - Alpha is ink coverage (derived from grayscale)
  *
  * Assumption: TIFF grayscale is "paper=white(255), ink=black(0)" -> alpha = 255 - gray
+ *
+ * Returns:
+ *  - pngBuf: Buffer
+ *  - hasInk: boolean (true if any alpha > threshold)
  */
-async function makePlatePngFromTiff(tiffPath, rgb /* [r,g,b] */) {
+async function makePlatePngFromTiff(tiffPath, rgb /* [r,g,b] */, inkThreshold = 2) {
   const { data, info } = await sharp(tiffPath)
     .ensureAlpha()
     .raw()
@@ -64,9 +68,13 @@ async function makePlatePngFromTiff(tiffPath, rgb /* [r,g,b] */) {
   // raw is RGBA even for grayscale conversions; we use R as gray
   const out = Buffer.alloc(info.width * info.height * 4);
 
+  let maxAlpha = 0;
+
   for (let i = 0; i < info.width * info.height; i++) {
     const gray = data[i * 4]; // 0..255
     const alpha = 255 - gray; // ink amount
+
+    if (alpha > maxAlpha) maxAlpha = alpha;
 
     out[i * 4 + 0] = rgb[0];
     out[i * 4 + 1] = rgb[1];
@@ -74,11 +82,13 @@ async function makePlatePngFromTiff(tiffPath, rgb /* [r,g,b] */) {
     out[i * 4 + 3] = alpha;
   }
 
-  return sharp(out, {
+  const pngBuf = await sharp(out, {
     raw: { width: info.width, height: info.height, channels: 4 },
   })
     .png()
     .toBuffer();
+
+  return { pngBuf, hasInk: maxAlpha > inkThreshold };
 }
 
 /**
@@ -206,7 +216,14 @@ async function processOneJob(job) {
 
       if (cls.kind === "cmyk") {
         const key = cls.key;
-        const pngBuf = await makePlatePngFromTiff(full, plateColor[key]);
+
+        const { pngBuf, hasInk } = await makePlatePngFromTiff(full, plateColor[key]);
+
+        // ✅ Skip blank CMYK plates (spot-only PDFs often generate blank CMYK TIFFs)
+        if (!hasInk) {
+          console.log(`[worker] CMYK plate '${key}' is blank — skipping upload`);
+          continue;
+        }
 
         const storagePath = `separations/${proofPageId}/page-${pageIndex}/${key}.png`;
         const url = await uploadAndGetPublicUrl(storagePath, pngBuf, "image/png");
@@ -226,13 +243,27 @@ async function processOneJob(job) {
         );
 
         // spots get a neutral “ink” look; viewer can color it if you want later
-        const spotPng = await makePlatePngFromTiff(full, [0, 0, 0]);
+        const { pngBuf: spotPng, hasInk: spotHasInk } = await makePlatePngFromTiff(full, [0, 0, 0]);
+
+        // Optional: skip blank spots too
+        if (!spotHasInk) {
+          console.log(`[worker] Spot plate '${spotNameGuess || "Spot"}' is blank — skipping upload`);
+          continue;
+        }
+
         const storagePath = `separations/${proofPageId}/page-${pageIndex}/spot-${spotNameGuess}.png`;
         const url = await uploadAndGetPublicUrl(storagePath, spotPng, "image/png");
 
         spot_plates.push({ name: spotNameGuess || "Spot", url });
         compositeLayers.push({ buffer: spotPng });
       }
+    }
+
+    // Helpful log for spot-only PDFs
+    const hasAnyCMYK = Boolean(c_url || m_url || y_url || k_url);
+    const hasAnySpot = spot_plates.length > 0;
+    if (!hasAnyCMYK && hasAnySpot) {
+      console.log("[worker] PDF appears spot-only — no CMYK plates uploaded");
     }
 
     // 5) Composite (optional but your schema supports it)
